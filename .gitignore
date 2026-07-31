@@ -1,0 +1,8 @@
+# Project place file
+/money-sucking-project-01.rbxlx
+
+# Roblox Studio lock files
+/*.rbxlx.lock
+/*.rbxl.lock
+
+sourcemap.json
