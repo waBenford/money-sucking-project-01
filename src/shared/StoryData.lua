@@ -15,7 +15,7 @@
 
 		local story = StoryData.getRandomStory("wandering_peddler")
 		local saved = StoryData.getStoryById("rain_on_the_window")
-		local first = StoryData.Travelers[StoryData.TravelerOrder[1]]
+		local first = StoryData.Travelers[StoryData.TravelerOrder[1] ]
 ]]
 
 local StoryData = {}
