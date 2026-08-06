@@ -28,8 +28,8 @@ local SPAWN_INTERVAL = 4 -- seconds between items
 local TRAVEL_TIME = 12 -- seconds to cross the belt
 
 local BELT_LENGTH = 80 -- studs
-local BELT_OFFSET_X = -30
-local BELT_OFFSET_Z = -40 -- plot-local, toward the hub
+local BELT_OFFSET_X = 50
+local BELT_OFFSET_Z = -10 -- plot-local, toward the hub
 local BELT_HEIGHT = 3 -- above the plot surface
 
 local ITEM_SIZE = Vector3.new(2, 2, 2)
@@ -87,8 +87,8 @@ local function ensureBelt(plot)
 
 	-- Derived from the plot's CFrame, so the belt inherits its rotation and
 	-- runs across the hub-facing edge -- the same trick ensureClaim uses.
-	conveyor.StartPart.CFrame = plot.CFrame * CFrame.new(BELT_OFFSET_X, BELT_HEIGHT, BELT_OFFSET_Z - (BELT_LENGTH / 2))
-	conveyor.EndPart.CFrame = plot.CFrame * CFrame.new(BELT_OFFSET_X, BELT_HEIGHT, BELT_OFFSET_Z + (BELT_LENGTH / 2))
+	conveyor.StartPart.CFrame = plot.CFrame * CFrame.new(BELT_OFFSET_X, BELT_HEIGHT, BELT_OFFSET_Z + (BELT_LENGTH / 2))
+	conveyor.EndPart.CFrame = plot.CFrame * CFrame.new(BELT_OFFSET_X, BELT_HEIGHT, BELT_OFFSET_Z - (BELT_LENGTH / 2))
 
 	return conveyor
 end
