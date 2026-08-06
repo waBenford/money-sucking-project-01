@@ -15,10 +15,12 @@
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
 local TweenService = game:GetService("TweenService")
 local Workspace = game:GetService("Workspace")
 
 local StoryData = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("StoryData"))
+local InventoryService = require(ServerScriptService:WaitForChild("Server"):WaitForChild("InventoryService"))
 
 --// Configuration
 
@@ -34,6 +36,8 @@ local BELT_HEIGHT = 3 -- above the plot surface
 
 local ITEM_SIZE = Vector3.new(2, 2, 2)
 local MARKER_SIZE = Vector3.new(4, 1, 6)
+
+local COLLECT_DISTANCE = 12 -- studs; the prompt's activation range
 
 -- Linear, not the default Quad: a belt runs at constant speed. Easing would
 -- make items visibly accelerate and bunch up mid-run.
@@ -143,8 +147,61 @@ local function createItem(story, conveyor)
 	label.TextStrokeTransparency = 0
 	label.Parent = billboard
 
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.Name = "CollectPrompt"
+	prompt.KeyboardKeyCode = Enum.KeyCode.E
+	prompt.ActionText = "Collect"
+	prompt.ObjectText = story.Name
+	prompt.MaxActivationDistance = COLLECT_DISTANCE
+	prompt.RequiresLineOfSight = false -- otherwise it flickers out as the item moves
+	prompt.Parent = item
+
 	item.Parent = conveyor.Items
 	return item
+end
+
+-- Every check here runs on the server. ProximityPrompt already enforces its own
+-- activation distance server-side, so this is about *who* may collect and
+-- ensuring an item can only ever be collected once.
+local function tryCollect(player, plot, state, item)
+	-- The double-collect guard. Triggered can fire again before the Destroy
+	-- below replicates, and the arrival tween may have already cleared this
+	-- entry. Either way, no entry means there is nothing left to collect.
+	if not state.items[item] then
+		return
+	end
+
+	-- Belts run on private plots, so only the owner may take from one. Silent
+	-- reject: a visitor holding E should not flood the server log.
+	if plot:GetAttribute("OwnerUserId") ~= player.UserId then
+		return
+	end
+
+	local character = player.Character
+	local root = character and character.PrimaryPart
+	if not root then
+		return
+	end
+
+	-- Belt-and-braces with deliberate slack for latency; the prompt's own
+	-- server-side range check is the real defence, not this.
+	if (root.Position - item.Position).Magnitude > COLLECT_DISTANCE * 2 then
+		return
+	end
+
+	local storyId = item:GetAttribute("StoryId")
+	if not storyId then
+		return
+	end
+
+	-- Mutate state before calling out. grantStory may yield once persistence
+	-- lands, and a yield between the guard above and this line would reopen
+	-- the double-collect window.
+	destroyItem(state, item)
+
+	-- Only the id crosses this boundary: InventoryService re-derives the story
+	-- and its BaseReward from StoryData, so nothing here can inflate a reward.
+	InventoryService.grantStory(player, storyId)
 end
 
 local function spawnItem(plot, state)
@@ -160,6 +217,10 @@ local function spawnItem(plot, state)
 	end
 
 	local item = createItem(story, conveyor)
+
+	item.CollectPrompt.Triggered:Connect(function(player)
+		tryCollect(player, plot, state, item)
+	end)
 
 	local tween = TweenService:Create(item, TWEEN_INFO, { CFrame = conveyor.EndPart.CFrame })
 	state.items[item] = tween
