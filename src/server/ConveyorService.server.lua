@@ -19,7 +19,9 @@ local ServerScriptService = game:GetService("ServerScriptService")
 local TweenService = game:GetService("TweenService")
 local Workspace = game:GetService("Workspace")
 
-local StoryData = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("StoryData"))
+local Shared = ReplicatedStorage:WaitForChild("Shared")
+local StoryData = require(Shared:WaitForChild("StoryData"))
+local Theme = require(Shared:WaitForChild("Theme"))
 local InventoryService = require(ServerScriptService:WaitForChild("Server"):WaitForChild("InventoryService"))
 
 --// Configuration
@@ -42,14 +44,6 @@ local COLLECT_DISTANCE = 12 -- studs; the prompt's activation range
 -- Linear, not the default Quad: a belt runs at constant speed. Easing would
 -- make items visibly accelerate and bunch up mid-run.
 local TWEEN_INFO = TweenInfo.new(TRAVEL_TIME, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut)
-
-local RARITY_COLORS = {
-	[1] = Color3.fromRGB(200, 200, 200), -- grey
-	[2] = Color3.fromRGB(80, 200, 120), -- green
-	[3] = Color3.fromRGB(70, 130, 230), -- blue
-	[4] = Color3.fromRGB(160, 90, 220), -- purple
-	[5] = Color3.fromRGB(255, 190, 60), -- gold
-}
 
 --// State
 
@@ -119,7 +113,9 @@ local function createItem(story, conveyor)
 	item.Anchored = true
 	item.CanCollide = false
 	item.Material = Enum.Material.Neon
-	item.Color = RARITY_COLORS[story.Rarity] or RARITY_COLORS[1]
+	-- Same palette the inventory slots use, so an item keeps its colour from the
+	-- belt into the bag.
+	item.Color = Theme.rarityColor(story.Rarity)
 	item.CFrame = conveyor.StartPart.CFrame
 
 	-- Read by the collection mechanic. StoryId is the authoritative one; the

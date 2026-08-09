@@ -14,6 +14,9 @@
         },
         "GetInventory": {
           "$className": "RemoteFunction"
+        },
+        "DiscardItem": {
+          "$className": "RemoteEvent"
         }
       }
     },

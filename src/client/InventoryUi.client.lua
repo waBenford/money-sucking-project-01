@@ -1,23 +1,44 @@
 --[[
 	InventoryUi
-	Shows the player's collected Stories. Press B to toggle.
+	The player's bag: a centred panel with category tabs, a search box, a grid of
+	item slots, a detail popup that appears when a slot is clicked, and a two-step
+	discard dialog behind its trash button.
 
-	Not Tab: Roblox's CoreGui reserves it for GUI keyboard navigation, so it
-	arrives with gameProcessed = true and the guard below discards it.
+	Opened by the on-screen button (the only way that works on a phone) or by
+	pressing B. Not Tab: Roblox's CoreGui reserves it for GUI keyboard
+	navigation, so it arrives with gameProcessed = true and the guard below
+	discards it. That same guard is why typing "b" into the search box does not
+	close the panel.
 
-	The server only ever sends storyIds and counts; everything displayed --
-	name, rarity, ordering -- is resolved here from the shared StoryData module.
+	One kind of item is one slot, and a stack stops at InventoryConfig.MAX_STACK
+	instead of spilling into a second slot, so "n/20" counts kinds held, not
+	copies. The server enforces both -- everything here is display.
 
-	Styling seam: createRow() is the only function that builds row visuals.
-	Swap its body for ReplicatedStorage.Assets.StoryRow:Clone() when you have
-	custom assets, and nothing else needs to change.
+	The server only ever sends storyIds, counts and a revision; everything shown
+	-- name, rarity, category, reward -- is resolved from the shared modules.
+
+	Layout is done in one fixed design space (DESIGN_WIDTH x DESIGN_HEIGHT) and a
+	UIScale shrinks the whole panel to fit the viewport. Mixing scale and offset
+	per child would make square grid cells and readable text impossible to hold
+	on both a monitor and a phone.
+
+	Styling seam: createSlot() is the only function that builds a slot's visuals,
+	and setDetail() the only one that writes the detail popup -- including showing
+	and hiding it, so nothing else needs to know it is conditional. Swap
+	createSlot's body for ReplicatedStorage.Assets.ItemSlot:Clone() when there are
+	icons; until then a slot shows the item's name as placeholder art.
 ]]
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
 
-local StoryData = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("StoryData"))
+local Shared = ReplicatedStorage:WaitForChild("Shared")
+local InventoryConfig = require(Shared:WaitForChild("InventoryConfig"))
+local ItemCategories = require(Shared:WaitForChild("ItemCategories"))
+local StoryData = require(Shared:WaitForChild("StoryData"))
+local Theme = require(Shared:WaitForChild("Theme"))
 
 -- Timed, so a missing instance says so instead of yielding forever. An untimed
 -- WaitForChild here would leave the script hanging with the UI simply absent --
@@ -30,198 +51,932 @@ end
 
 local InventoryUpdated = Remotes:WaitForChild("InventoryUpdated", 10)
 local GetInventory = Remotes:WaitForChild("GetInventory", 10)
+local DiscardItem = Remotes:WaitForChild("DiscardItem", 10)
 
-if not (InventoryUpdated and GetInventory) then
-	warn("InventoryUi: Remotes folder is missing InventoryUpdated or GetInventory")
+if not (InventoryUpdated and GetInventory and DiscardItem) then
+	warn("InventoryUi: Remotes folder is missing InventoryUpdated, GetInventory or DiscardItem")
 	return
 end
 
 --// Configuration
 
 local TOGGLE_KEY = Enum.KeyCode.B
-local ROW_HEIGHT = 32
 
-local PANEL_BG = Color3.fromRGB(25, 27, 34)
-local ROW_BG = Color3.fromRGB(38, 41, 50)
-local TEXT_COLOR = Color3.fromRGB(235, 235, 240)
+-- The design space every offset below is written in. The panel never renders at
+-- more than 1:1; it only ever scales down.
+local DESIGN_WIDTH = 960
+local DESIGN_HEIGHT = 480
 
-local RARITY_COLORS = {
-	[1] = Color3.fromRGB(200, 200, 200),
-	[2] = Color3.fromRGB(80, 200, 120),
-	[3] = Color3.fromRGB(70, 130, 230),
-	[4] = Color3.fromRGB(160, 90, 220),
-	[5] = Color3.fromRGB(255, 190, 60),
-}
+local VIEWPORT_MARGIN_X = 0.92 -- fraction of the screen the panel may occupy
+local VIEWPORT_MARGIN_Y = 0.86
+local MIN_SCALE = 0.4 -- below this the text stops being readable anyway
+
+local PADDING = 14
+local GAP = 10
+local HEADER_HEIGHT = 44
+local TAB_HEIGHT = 34
+local TOOLBAR_HEIGHT = 32
+local DETAIL_HEIGHT = 140
+local CELL_SIZE = 72
+local CELL_PADDING = 8
+
+local CONTENT_WIDTH = DESIGN_WIDTH - (PADDING * 2)
+local BODY_Y = PADDING + HEADER_HEIGHT + GAP + TAB_HEIGHT + GAP
+local BODY_HEIGHT = DESIGN_HEIGHT - BODY_Y - PADDING
+local GRID_Y = TOOLBAR_HEIGHT + GAP
+-- The grid owns the whole area below the toolbar. The detail popup is drawn over
+-- its lower strip rather than given a lane of its own, so nothing is left as
+-- dead space while no item is selected.
+local GRID_HEIGHT = BODY_HEIGHT - GRID_Y
 
 local player = Players.LocalPlayer
 
 --// State
 
--- [storyId] = { row = Frame, count = number }
+-- [storyId] = { slot = TextButton, count = number }
 local entries = {}
 
---// UI construction
+local activeTab = ItemCategories.ALL
+local selectedId = nil
+local searchText = ""
 
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "InventoryUi"
--- Essential: the default destroys this on every respawn, which would leave
--- every cached row reference pointing at a destroyed instance and silently
--- break all further updates.
-screenGui.ResetOnSpawn = false
-screenGui.Enabled = false
-screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-screenGui.Parent = player:WaitForChild("PlayerGui")
+-- Revision of the newest change already applied. Counts can go down now, so
+-- "the bigger count wins" no longer works: the server's revision number is what
+-- orders messages. See the snapshot block at the bottom.
+local localRevision = 0
+local snapshotApplied = false
+local bufferedUpdates = {}
 
-local panel = Instance.new("Frame")
-panel.Name = "Panel"
-panel.AnchorPoint = Vector2.new(1, 0.5)
-panel.Position = UDim2.new(1, -16, 0.5, 0)
-panel.Size = UDim2.fromOffset(340, 400)
-panel.BackgroundColor3 = PANEL_BG
-panel.BackgroundTransparency = 0.1
-panel.BorderSizePixel = 0
-panel.Parent = screenGui
+-- How many copies the open discard dialog is about to throw away.
+local discardAmount = 1
 
-local panelCorner = Instance.new("UICorner")
-panelCorner.CornerRadius = UDim.new(0, 8)
-panelCorner.Parent = panel
+--// Helpers
 
-local title = Instance.new("TextLabel")
-title.Name = "Title"
-title.Size = UDim2.new(1, 0, 0, 36)
-title.BackgroundTransparency = 1
-title.Text = "Stories"
-title.TextColor3 = TEXT_COLOR
-title.TextSize = 20
-title.Font = Enum.Font.GothamBold
-title.Parent = panel
+-- Properties first, Parent last: every write happens while the instance is
+-- still outside the tree, so the engine lays the panel out once at the end
+-- rather than on each assignment.
+local function make(className, props)
+	local instance = Instance.new(className)
+	local parent = props.Parent
+	props.Parent = nil
 
-local list = Instance.new("ScrollingFrame")
-list.Name = "List"
-list.Position = UDim2.fromOffset(8, 40)
-list.Size = UDim2.new(1, -16, 1, -48)
-list.BackgroundTransparency = 1
-list.BorderSizePixel = 0
-list.ScrollBarThickness = 4
--- UIListLayout drives the canvas height, so rows can be added without any
--- manual CanvasSize arithmetic.
-list.CanvasSize = UDim2.new()
-list.AutomaticCanvasSize = Enum.AutomaticSize.Y
-list.Parent = panel
+	for key, value in pairs(props) do
+		instance[key] = value
+	end
 
-local layout = Instance.new("UIListLayout")
-layout.SortOrder = Enum.SortOrder.LayoutOrder
-layout.Padding = UDim.new(0, 4)
-layout.Parent = list
-
---// Rows
-
-local function label(name, parent, xScale, widthScale, alignment)
-	local text = Instance.new("TextLabel")
-	text.Name = name
-	text.Position = UDim2.fromScale(xScale, 0)
-	text.Size = UDim2.fromScale(widthScale, 1)
-	text.BackgroundTransparency = 1
-	text.TextColor3 = TEXT_COLOR
-	text.TextSize = 14
-	text.Font = Enum.Font.Gotham
-	text.TextXAlignment = alignment
-	text.Parent = parent
-	return text
+	instance.Parent = parent
+	return instance
 end
 
--- The single styling seam. Everything below only reads row.Name / row.Rarity /
--- row.Quantity, so replacing this body with a cloned asset is a local change.
-local function createRow(story)
-	local row = Instance.new("Frame")
-	row.Name = story.Id
-	row.Size = UDim2.new(1, 0, 0, ROW_HEIGHT)
-	row.BackgroundColor3 = ROW_BG
-	row.BorderSizePixel = 0
-	-- Higher rarity sorts to the top.
-	row.LayoutOrder = StoryData.MAX_RARITY - story.Rarity
+local function round(instance, radius)
+	make("UICorner", { CornerRadius = UDim.new(0, radius), Parent = instance })
+	return instance
+end
 
-	local corner = Instance.new("UICorner")
-	corner.CornerRadius = UDim.new(0, 4)
-	corner.Parent = row
+local function label(props)
+	props.BackgroundTransparency = props.BackgroundTransparency or 1
+	props.TextColor3 = props.TextColor3 or Theme.TEXT
+	props.TextSize = props.TextSize or 14
+	props.Font = props.Font or Enum.Font.Gotham
+	return make("TextLabel", props)
+end
 
-	local padding = Instance.new("UIPadding")
-	padding.PaddingLeft = UDim.new(0, 8)
-	padding.PaddingRight = UDim.new(0, 8)
-	padding.Parent = row
+local function button(props)
+	props.BorderSizePixel = 0
+	props.TextColor3 = props.TextColor3 or Theme.TEXT
+	props.TextSize = props.TextSize or 14
+	props.Font = props.Font or Enum.Font.GothamBold
+	props.AutoButtonColor = true
+	return make("TextButton", props)
+end
 
-	-- "StoryName", not "Name": a child called Name would be shadowed by the
-	-- Frame's own Name property, so row.Name returns the id string instead.
-	label("StoryName", row, 0, 0.52, Enum.TextXAlignment.Left).Text = story.Name
+-- Driven by MAX_RARITY, so adding a sixth tier needs no UI change.
+local function rarityStars(rarity)
+	return string.rep("*", rarity) .. string.rep("-", StoryData.MAX_RARITY - rarity)
+end
 
-	local rarity = label("Rarity", row, 0.52, 0.32, Enum.TextXAlignment.Center)
-	-- Driven by MAX_RARITY, so adding a sixth tier needs no UI change.
-	rarity.Text = string.rep("*", story.Rarity) .. string.rep("-", StoryData.MAX_RARITY - story.Rarity)
-	rarity.TextColor3 = RARITY_COLORS[story.Rarity] or TEXT_COLOR
+local function slotsUsed()
+	local used = 0
+	for _ in pairs(entries) do
+		used += 1
+	end
+	return used
+end
 
-	label("Quantity", row, 0.84, 0.16, Enum.TextXAlignment.Right)
+--// Screen
 
-	return row
+local screenGui = make("ScreenGui", {
+	Name = "InventoryUi",
+	-- Essential: the default destroys this on every respawn, which would leave
+	-- every cached slot reference pointing at a destroyed instance and silently
+	-- break all further updates.
+	ResetOnSpawn = false,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	Parent = player:WaitForChild("PlayerGui"),
+})
+
+-- Below the topbar but clear of both thumbstick and jump button, which own the
+-- bottom corners on touch devices.
+local openButton = round(button({
+	Name = "OpenButton",
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -16, 0, 16),
+	Size = UDim2.fromOffset(56, 56),
+	BackgroundColor3 = Theme.HEADER_BG,
+	Text = "BAG",
+	TextSize = 13,
+	Parent = screenGui,
+}), 28)
+
+local panel = round(make("Frame", {
+	Name = "Panel",
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(DESIGN_WIDTH, DESIGN_HEIGHT),
+	BackgroundColor3 = Theme.PANEL_BG,
+	BackgroundTransparency = 0.05,
+	BorderSizePixel = 0,
+	Visible = false,
+	Parent = screenGui,
+}), 12)
+
+local panelScale = make("UIScale", { Parent = panel })
+
+-- Scales about the panel's own centre because its AnchorPoint is (0.5, 0.5), so
+-- shrinking never pushes it off screen.
+local function updateScale()
+	local camera = Workspace.CurrentCamera
+	local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
+
+	if viewport.X <= 0 or viewport.Y <= 0 then
+		return -- one frame during camera setup
+	end
+
+	local scale = math.min(
+		(viewport.X * VIEWPORT_MARGIN_X) / DESIGN_WIDTH,
+		(viewport.Y * VIEWPORT_MARGIN_Y) / DESIGN_HEIGHT,
+		1
+	)
+
+	panelScale.Scale = math.max(scale, MIN_SCALE)
+end
+
+--// Header
+
+local titleBar = round(make("Frame", {
+	Name = "TitleBar",
+	AnchorPoint = Vector2.new(0.5, 0),
+	Position = UDim2.new(0.5, 0, 0, PADDING),
+	Size = UDim2.fromOffset(360, HEADER_HEIGHT),
+	BackgroundColor3 = Theme.HEADER_BG,
+	BorderSizePixel = 0,
+	Parent = panel,
+}), 8)
+
+label({
+	Name = "Title",
+	Size = UDim2.fromScale(1, 1),
+	Text = "Inventory",
+	TextSize = 22,
+	Font = Enum.Font.GothamBold,
+	Parent = titleBar,
+})
+
+local closeButton = round(button({
+	Name = "Close",
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -PADDING, 0, PADDING),
+	Size = UDim2.fromOffset(HEADER_HEIGHT, HEADER_HEIGHT),
+	BackgroundColor3 = Theme.DANGER,
+	Text = "X",
+	TextSize = 20,
+	Parent = panel,
+}), 8)
+
+--// Tabs
+
+local tabsRow = make("Frame", {
+	Name = "Tabs",
+	Position = UDim2.fromOffset(PADDING, PADDING + HEADER_HEIGHT + GAP),
+	Size = UDim2.fromOffset(CONTENT_WIDTH, TAB_HEIGHT),
+	BackgroundTransparency = 1,
+	Parent = panel,
+})
+
+make("UIListLayout", {
+	FillDirection = Enum.FillDirection.Horizontal,
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	Padding = UDim.new(0, 8),
+	Parent = tabsRow,
+})
+
+-- [categoryId] = TextButton. Built from ItemCategories.Order, so a new category
+-- appears here without touching this file.
+local tabButtons = {}
+
+--// Body
+
+local body = make("Frame", {
+	Name = "Body",
+	Position = UDim2.fromOffset(PADDING, BODY_Y),
+	Size = UDim2.fromOffset(CONTENT_WIDTH, BODY_HEIGHT),
+	BackgroundTransparency = 1,
+	Parent = panel,
+})
+
+local searchBox = round(make("TextBox", {
+	Name = "Search",
+	Size = UDim2.fromOffset(280, TOOLBAR_HEIGHT),
+	BackgroundColor3 = Theme.FIELD_BG,
+	BorderSizePixel = 0,
+	Text = "",
+	PlaceholderText = "Search",
+	PlaceholderColor3 = Theme.TEXT_MUTED,
+	TextColor3 = Theme.TEXT,
+	TextSize = 14,
+	Font = Enum.Font.Gotham,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	-- Otherwise clicking the box to fix a typo wipes the filter.
+	ClearTextOnFocus = false,
+	Parent = body,
+}), 6)
+
+make("UIPadding", {
+	PaddingLeft = UDim.new(0, 10),
+	PaddingRight = UDim.new(0, 10),
+	Parent = searchBox,
+})
+
+local capacityLabel = label({
+	Name = "Capacity",
+	Position = UDim2.fromOffset(296, 0),
+	Size = UDim2.fromOffset(160, TOOLBAR_HEIGHT),
+	Text = "0/" .. InventoryConfig.MAX_SLOTS,
+	TextSize = 18,
+	Font = Enum.Font.GothamBold,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Parent = body,
+})
+
+local grid = make("ScrollingFrame", {
+	Name = "Grid",
+	Position = UDim2.fromOffset(0, GRID_Y),
+	Size = UDim2.fromOffset(CONTENT_WIDTH, GRID_HEIGHT),
+	BackgroundColor3 = Theme.HEADER_BG,
+	BackgroundTransparency = 0.5,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 8,
+	ScrollingDirection = Enum.ScrollingDirection.Y,
+	-- UIGridLayout drives the canvas height, so slots can be added without any
+	-- manual CanvasSize arithmetic.
+	CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	Parent = body,
+})
+round(grid, 6)
+
+make("UIPadding", {
+	PaddingTop = UDim.new(0, 8),
+	PaddingLeft = UDim.new(0, 8),
+	PaddingBottom = UDim.new(0, 8),
+	Parent = grid,
+})
+
+make("UIGridLayout", {
+	CellSize = UDim2.fromOffset(CELL_SIZE, CELL_SIZE),
+	CellPadding = UDim2.fromOffset(CELL_PADDING, CELL_PADDING),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	Parent = grid,
+})
+
+-- Parented to the body, not the grid: a child of the grid would be laid out as
+-- another cell and would drag the canvas height around.
+local emptyState = label({
+	Name = "EmptyState",
+	Position = UDim2.fromOffset(0, GRID_Y),
+	Size = UDim2.fromOffset(CONTENT_WIDTH, GRID_HEIGHT),
+	Text = "",
+	TextColor3 = Theme.TEXT_MUTED,
+	TextWrapped = true,
+	Parent = body,
+})
+
+--// Detail popup
+--
+-- Hidden until a slot is clicked, and drawn above the grid it overlaps. The two
+-- rows a full inventory needs sit clear of it, so nothing reachable ends up
+-- behind the popup.
+
+local detail = round(make("Frame", {
+	Name = "Detail",
+	Position = UDim2.fromOffset(0, BODY_HEIGHT - DETAIL_HEIGHT),
+	Size = UDim2.fromOffset(CONTENT_WIDTH, DETAIL_HEIGHT),
+	BackgroundColor3 = Theme.HEADER_BG,
+	BorderSizePixel = 0,
+	Visible = false,
+	ZIndex = 3,
+	Parent = body,
+}), 8)
+
+-- Reads as a layer sitting on top of the grid rather than part of it.
+make("UIStroke", {
+	Color = Theme.ACCENT,
+	Thickness = 2,
+	Transparency = 0.4,
+	Parent = detail,
+})
+
+local detailInfo = make("ScrollingFrame", {
+	Name = "Info",
+	Position = UDim2.fromOffset(14, 10),
+	Size = UDim2.new(1, -80, 1, -20),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 6,
+	ScrollingDirection = Enum.ScrollingDirection.Y,
+	CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	Parent = detail,
+})
+
+make("UIListLayout", {
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	Padding = UDim.new(0, 4),
+	Parent = detailInfo,
+})
+
+-- Built once and rewritten by setDetail; the popup always shows the same set of
+-- lines, so there is nothing to create or destroy per selection.
+local function detailLine(order, props)
+	props.LayoutOrder = order
+	props.Size = UDim2.new(1, 0, 0, props.LineHeight or 20)
+	props.LineHeight = nil
+	props.TextXAlignment = Enum.TextXAlignment.Left
+	props.TextWrapped = true
+	props.Parent = detailInfo
+	return label(props)
+end
+
+local detailName = detailLine(1, { Name = "ItemName", Text = "", TextSize = 20, Font = Enum.Font.GothamBold, LineHeight = 26 })
+local detailRarity = detailLine(2, { Name = "Rarity", Text = "" })
+local detailCategory = detailLine(3, { Name = "Category", Text = "", TextColor3 = Theme.TEXT_MUTED })
+local detailReward = detailLine(4, { Name = "Reward", Text = "", TextColor3 = Theme.TEXT_MUTED })
+local detailHeld = detailLine(5, { Name = "Held", Text = "", TextColor3 = Theme.TEXT_MUTED })
+
+-- The popup's own dismiss. Without it the only ways out would be switching tab
+-- or emptying the stack, neither of which is obvious.
+local detailClose = round(button({
+	Name = "Close",
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -12, 0, 10),
+	Size = UDim2.fromOffset(28, 28),
+	BackgroundColor3 = Theme.FIELD_BG,
+	Text = "X",
+	TextSize = 14,
+	Parent = detail,
+}), 6)
+
+local trashButton = round(button({
+	Name = "Trash",
+	AnchorPoint = Vector2.new(1, 1),
+	Position = UDim2.new(1, -12, 1, -12),
+	Size = UDim2.fromOffset(44, 44),
+	BackgroundColor3 = Theme.DANGER,
+	Text = "DEL",
+	TextSize = 13,
+	Parent = detail,
+}), 6)
+
+--// Discard dialog
+
+-- Active = true so the dim layer swallows clicks: without it the grid and tabs
+-- behind stay clickable while a confirmation is on screen.
+local dialogOverlay = make("Frame", {
+	Name = "DiscardOverlay",
+	Size = UDim2.fromScale(1, 1),
+	BackgroundColor3 = Color3.new(0, 0, 0),
+	BackgroundTransparency = 0.45,
+	BorderSizePixel = 0,
+	Active = true,
+	Visible = false,
+	ZIndex = 5,
+	Parent = panel,
+})
+
+local dialog = round(make("Frame", {
+	Name = "Dialog",
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(360, 190),
+	BackgroundColor3 = Theme.PANEL_BG,
+	BorderSizePixel = 0,
+	ZIndex = 6,
+	Parent = dialogOverlay,
+}), 10)
+
+local function dialogStep(name)
+	return make("Frame", {
+		Name = name,
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Visible = false,
+		Parent = dialog,
+	})
+end
+
+-- Step one: how many.
+local amountStep = dialogStep("AmountStep")
+
+label({
+	Position = UDim2.fromOffset(0, 14),
+	Size = UDim2.new(1, 0, 0, 24),
+	Text = "Throw away how many?",
+	TextSize = 17,
+	Font = Enum.Font.GothamBold,
+	Parent = amountStep,
+})
+
+local amountItemName = label({
+	Name = "ItemName",
+	Position = UDim2.fromOffset(16, 40),
+	Size = UDim2.new(1, -32, 0, 20),
+	Text = "",
+	TextColor3 = Theme.TEXT_MUTED,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	Parent = amountStep,
+})
+
+local minusButton = round(button({
+	Name = "Minus",
+	Position = UDim2.fromOffset(104, 70),
+	Size = UDim2.fromOffset(44, 44),
+	BackgroundColor3 = Theme.FIELD_BG,
+	Text = "-",
+	TextSize = 24,
+	Parent = amountStep,
+}), 6)
+
+local amountLabel = label({
+	Name = "Amount",
+	Position = UDim2.fromOffset(148, 70),
+	Size = UDim2.fromOffset(64, 44),
+	Text = "1",
+	TextSize = 22,
+	Font = Enum.Font.GothamBold,
+	Parent = amountStep,
+})
+
+local plusButton = round(button({
+	Name = "Plus",
+	Position = UDim2.fromOffset(212, 70),
+	Size = UDim2.fromOffset(44, 44),
+	BackgroundColor3 = Theme.FIELD_BG,
+	Text = "+",
+	TextSize = 24,
+	Parent = amountStep,
+}), 6)
+
+local amountCancel = round(button({
+	Name = "Cancel",
+	Position = UDim2.fromOffset(24, 130),
+	Size = UDim2.fromOffset(140, 40),
+	BackgroundColor3 = Theme.FIELD_BG,
+	Text = "Cancel",
+	Parent = amountStep,
+}), 6)
+
+local amountNext = round(button({
+	Name = "Next",
+	Position = UDim2.fromOffset(196, 130),
+	Size = UDim2.fromOffset(140, 40),
+	BackgroundColor3 = Theme.ACCENT,
+	Text = "Next",
+	Parent = amountStep,
+}), 6)
+
+-- Step two: are you sure.
+local confirmStep = dialogStep("ConfirmStep")
+
+local confirmMessage = label({
+	Name = "Message",
+	Position = UDim2.fromOffset(20, 24),
+	Size = UDim2.new(1, -40, 0, 80),
+	Text = "",
+	TextSize = 16,
+	TextWrapped = true,
+	Parent = confirmStep,
+})
+
+local confirmCancel = round(button({
+	Name = "Cancel",
+	Position = UDim2.fromOffset(24, 130),
+	Size = UDim2.fromOffset(140, 40),
+	BackgroundColor3 = Theme.FIELD_BG,
+	Text = "Back",
+	Parent = confirmStep,
+}), 6)
+
+local confirmDiscard = round(button({
+	Name = "Confirm",
+	Position = UDim2.fromOffset(196, 130),
+	Size = UDim2.fromOffset(140, 40),
+	BackgroundColor3 = Theme.DANGER,
+	Text = "Discard",
+	Parent = confirmStep,
+}), 6)
+
+--// Rendering
+
+local refresh -- forward declared: selection and the dialog both drive it
+
+local function setDetail(storyId)
+	local entry = storyId and entries[storyId]
+	local story = storyId and StoryData.getStoryById(storyId)
+
+	if not (entry and story) then
+		-- Nothing selected: the whole popup goes away rather than sitting there
+		-- empty, which is what the mockup's "appears when you click an item" means.
+		detail.Visible = false
+		return
+	end
+
+	detailName.Text = story.Name
+	detailRarity.Text = ("Rarity  %s"):format(rarityStars(story.Rarity))
+	detailRarity.TextColor3 = Theme.rarityColor(story.Rarity)
+	-- The last fallback is for data that forgot to set a category: a nil here
+	-- would make format() throw and take the whole popup with it.
+	local categoryName = ItemCategories.DisplayNames[story.Category] or story.Category or "Unknown"
+	detailCategory.Text = ("Category  %s"):format(categoryName)
+	detailReward.Text = ("Dream reward  %d per cycle"):format(story.BaseReward)
+	detailHeld.Text = ("Held  %d / %d"):format(entry.count, InventoryConfig.MAX_STACK)
+
+	detail.Visible = true
+end
+
+-- Passing nil dismisses the popup and clears the highlight.
+local function selectSlot(storyId)
+	selectedId = storyId
+	setDetail(storyId)
+
+	for id, entry in pairs(entries) do
+		entry.slot.BackgroundColor3 = (id == storyId) and Theme.SLOT_SELECTED_BG or Theme.SLOT_BG
+	end
+end
+
+detailClose.MouseButton1Click:Connect(function()
+	selectSlot(nil)
+end)
+
+-- The single styling seam. Everything below only reads slot.Quantity and
+-- slot.BackgroundColor3, so replacing this body with a cloned asset is a local
+-- change.
+local function createSlot(story)
+	local slot = round(button({
+		Name = story.Id,
+		BackgroundColor3 = Theme.SLOT_BG,
+		Text = "",
+		-- Higher rarity sorts to the top.
+		LayoutOrder = StoryData.MAX_RARITY - story.Rarity,
+	}), 6)
+
+	make("UIStroke", {
+		Color = Theme.rarityColor(story.Rarity),
+		Thickness = 2,
+		Parent = slot,
+	})
+
+	-- Placeholder art: the name, shrunk to fit. Becomes an ImageLabel the moment
+	-- there are icons to point it at.
+	label({
+		Name = "Icon",
+		Position = UDim2.fromOffset(4, 4),
+		Size = UDim2.new(1, -8, 1, -20),
+		Text = story.Name,
+		TextSize = 11,
+		TextWrapped = true,
+		TextColor3 = Theme.TEXT_MUTED,
+		Parent = slot,
+	})
+
+	label({
+		Name = "Quantity",
+		AnchorPoint = Vector2.new(1, 1),
+		Position = UDim2.new(1, -4, 1, -2),
+		Size = UDim2.fromOffset(30, 16),
+		Text = "x0",
+		TextSize = 13,
+		Font = Enum.Font.GothamBold,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Parent = slot,
+	})
+
+	slot.MouseButton1Click:Connect(function()
+		selectSlot(story.Id)
+	end)
+
+	return slot
+end
+
+local closeDialog -- forward declared: refresh closes it when a stack vanishes
+
+function refresh()
+	local visible = 0
+
+	for storyId, entry in pairs(entries) do
+		local story = StoryData.getStoryById(storyId)
+		local matchesTab = story and ItemCategories.matches(activeTab, story.Category)
+		local matchesSearch = searchText == ""
+			or (story and string.find(string.lower(story.Name), searchText, 1, true) ~= nil)
+
+		local shown = (matchesTab and matchesSearch) or false
+		entry.slot.Visible = shown
+
+		if shown then
+			visible += 1
+		end
+	end
+
+	-- A selection the current tab or search has hidden must let go of the detail
+	-- strip too, or the trash button stays live for an item no longer on screen.
+	if selectedId then
+		local selected = entries[selectedId]
+		if not (selected and selected.slot.Visible) then
+			selectSlot(nil)
+			closeDialog()
+		end
+	end
+
+	if visible > 0 then
+		emptyState.Visible = false
+	else
+		emptyState.Visible = true
+		emptyState.Text = if searchText ~= ""
+			then ("Nothing here matches \"%s\"."):format(searchBox.Text)
+			else ItemCategories.EmptyMessages[activeTab] or "Nothing here yet."
+	end
+
+	local used = slotsUsed()
+	capacityLabel.Text = ("%d/%d"):format(used, InventoryConfig.MAX_SLOTS)
+	capacityLabel.TextColor3 = (used >= InventoryConfig.MAX_SLOTS) and Theme.DANGER or Theme.TEXT
+
+	for categoryId, tabButton in pairs(tabButtons) do
+		local isActive = categoryId == activeTab
+		tabButton.BackgroundColor3 = isActive and Theme.ACCENT or Theme.HEADER_BG
+		tabButton.TextColor3 = isActive and Color3.new(1, 1, 1) or Theme.TEXT
+	end
 end
 
 local function setCount(storyId, count)
 	local story = StoryData.getStoryById(storyId)
 	if not story then
 		-- A story removed in a later update: ignore rather than render a blank
-		-- row from an old save.
+		-- slot from an old save.
 		return
 	end
 
 	local entry = entries[storyId]
 
+	if count <= 0 then
+		-- Destroyed, not left showing "x0": the slot has to disappear, and a
+		-- lingering entry would also keep counting against the n/20 display.
+		if entry then
+			entry.slot:Destroy()
+			entries[storyId] = nil
+		end
+
+		-- refresh() lets go of the selection and closes any open dialog once the
+		-- entry is gone, so there is nothing else to clean up here.
+		refresh()
+		return
+	end
+
 	if not entry then
-		local row = createRow(story)
-		row.Parent = list
-		entry = { row = row, count = 0 }
+		local slot = createSlot(story)
+		slot.Parent = grid
+		entry = { slot = slot, count = 0 }
 		entries[storyId] = entry
 	end
 
 	entry.count = count
-	entry.row.Quantity.Text = "x" .. count
+	entry.slot.Quantity.Text = "x" .. count
+
+	if selectedId == storyId then
+		setDetail(storyId)
+		-- The stack may have shrunk under an open dialog.
+		discardAmount = math.clamp(discardAmount, 1, count)
+		amountLabel.Text = tostring(discardAmount)
+	end
+
+	refresh()
 end
+
+--// Tabs, search, open and close
+
+for order, categoryId in ipairs(ItemCategories.Order) do
+	local tabButton = round(button({
+		Name = categoryId,
+		LayoutOrder = order,
+		-- Sized by its own text, so a longer category name cannot be clipped.
+		AutomaticSize = Enum.AutomaticSize.X,
+		Size = UDim2.fromOffset(0, TAB_HEIGHT),
+		BackgroundColor3 = Theme.HEADER_BG,
+		Text = ItemCategories.DisplayNames[categoryId] or categoryId,
+		Parent = tabsRow,
+	}), 6)
+
+	make("UIPadding", {
+		PaddingLeft = UDim.new(0, 18),
+		PaddingRight = UDim.new(0, 18),
+		Parent = tabButton,
+	})
+
+	tabButton.MouseButton1Click:Connect(function()
+		activeTab = categoryId
+		refresh()
+	end)
+
+	tabButtons[categoryId] = tabButton
+end
+
+searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+	-- Lowered once here rather than per slot on every keystroke.
+	searchText = string.lower(searchBox.Text)
+	refresh()
+end)
+
+local function setPanelOpen(open)
+	panel.Visible = open
+
+	if not open then
+		closeDialog()
+	end
+end
+
+openButton.MouseButton1Click:Connect(function()
+	setPanelOpen(not panel.Visible)
+end)
+
+closeButton.MouseButton1Click:Connect(function()
+	setPanelOpen(false)
+end)
+
+--// Discard flow
+
+function closeDialog()
+	dialogOverlay.Visible = false
+	amountStep.Visible = false
+	confirmStep.Visible = false
+end
+
+local function showAmountStep()
+	amountStep.Visible = true
+	confirmStep.Visible = false
+	amountLabel.Text = tostring(discardAmount)
+end
+
+local function setAmount(amount)
+	local entry = selectedId and entries[selectedId]
+	if not entry then
+		return
+	end
+
+	discardAmount = math.clamp(amount, 1, entry.count)
+	amountLabel.Text = tostring(discardAmount)
+end
+
+trashButton.MouseButton1Click:Connect(function()
+	local entry = selectedId and entries[selectedId]
+	local story = selectedId and StoryData.getStoryById(selectedId)
+	if not (entry and story) then
+		return
+	end
+
+	discardAmount = 1
+	amountItemName.Text = story.Name
+	dialogOverlay.Visible = true
+	showAmountStep()
+end)
+
+minusButton.MouseButton1Click:Connect(function()
+	setAmount(discardAmount - 1)
+end)
+
+plusButton.MouseButton1Click:Connect(function()
+	setAmount(discardAmount + 1)
+end)
+
+amountCancel.MouseButton1Click:Connect(closeDialog)
+confirmCancel.MouseButton1Click:Connect(showAmountStep)
+
+amountNext.MouseButton1Click:Connect(function()
+	local story = selectedId and StoryData.getStoryById(selectedId)
+	if not story then
+		closeDialog()
+		return
+	end
+
+	confirmMessage.Text = ("Throw away %d x %s?\nThis cannot be undone -- discarded Stories are gone, not sold.")
+		:format(discardAmount, story.Name)
+
+	amountStep.Visible = false
+	confirmStep.Visible = true
+end)
+
+confirmDiscard.MouseButton1Click:Connect(function()
+	local storyId = selectedId
+	closeDialog()
+
+	if not storyId then
+		return
+	end
+
+	-- A request, not an instruction: the count on screen only changes when the
+	-- server answers on InventoryUpdated, so a rejected discard cannot leave the
+	-- UI showing a stack the player still owns.
+	DiscardItem:FireServer(storyId, discardAmount)
+end)
 
 --// Server sync
 
+local function applyUpdate(storyId, count, revision)
+	if type(revision) == "number" then
+		-- Anything at or behind what is already applied is a straggler from
+		-- before the snapshot; applying it would resurrect an old count.
+		if revision <= localRevision then
+			return
+		end
+		localRevision = revision
+	end
+
+	setCount(storyId, count)
+end
+
 -- Connected before the snapshot request below: a grant landing during the
--- round-trip would otherwise be missed entirely.
-InventoryUpdated.OnClientEvent:Connect(function(storyId, newCount)
-	setCount(storyId, newCount)
+-- round-trip would otherwise be missed entirely. Until the snapshot has been
+-- applied these are held back, because the snapshot overwrites counts wholesale
+-- and would undo them.
+InventoryUpdated.OnClientEvent:Connect(function(storyId, count, revision)
+	if not snapshotApplied then
+		table.insert(bufferedUpdates, { storyId = storyId, count = count, revision = revision })
+		return
+	end
+
+	applyUpdate(storyId, count, revision)
 end)
 
 task.spawn(function()
 	local snapshot = GetInventory:InvokeServer()
-	if type(snapshot) ~= "table" then
-		return -- throttled, or the server declined
+
+	-- nil means throttled or declined. The buffered updates below still replay,
+	-- so the panel fills in from live grants instead of staying blank forever.
+	if type(snapshot) == "table" and type(snapshot.items) == "table" then
+		localRevision = tonumber(snapshot.revision) or 0
+
+		for storyId, count in pairs(snapshot.items) do
+			setCount(storyId, count)
+		end
 	end
 
-	for storyId, count in pairs(snapshot) do
-		local existing = entries[storyId]
+	-- Nothing between here and the end of the replay yields, so no update can
+	-- slip past both the buffer and this loop.
+	snapshotApplied = true
 
-		-- max() because connecting the event first means a live update may
-		-- already have arrived with a newer count, and this snapshot could be
-		-- staler than it.
-		--
-		-- Correct only while counts are monotonic, which holds because nothing
-		-- calls consumeStory yet. When the bed starts consuming Stories this
-		-- must become a sequenced/versioned snapshot instead.
-		setCount(storyId, math.max(existing and existing.count or 0, count))
+	for _, update in ipairs(bufferedUpdates) do
+		applyUpdate(update.storyId, update.count, update.revision)
 	end
+
+	bufferedUpdates = {}
 end)
 
---// Toggle
+--// Lifecycle
 
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
-	-- Same guard as Sprint.client.lua: Tab typed into chat must not toggle.
+	-- Same guard as Sprint.client.lua. It is also what keeps typing "b" into the
+	-- search box from closing the panel.
 	if gameProcessed then
 		return
 	end
 
 	if input.KeyCode == TOGGLE_KEY then
-		screenGui.Enabled = not screenGui.Enabled
+		setPanelOpen(not panel.Visible)
 	end
 end)
+
+updateScale()
+
+-- The camera is occasionally not assigned yet on the first frame, and the
+-- viewport changes on window resize and on a phone rotating.
+Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+	local camera = Workspace.CurrentCamera
+	if camera then
+		camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateScale)
+		updateScale()
+	end
+end)
+
+if Workspace.CurrentCamera then
+	Workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateScale)
+end
+
+setDetail(nil)
+refresh()
