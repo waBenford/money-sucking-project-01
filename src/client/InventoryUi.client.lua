@@ -1,6 +1,9 @@
 --[[
 	InventoryUi
-	Shows the player's collected Stories. Press Tab to toggle.
+	Shows the player's collected Stories. Press B to toggle.
+
+	Not Tab: Roblox's CoreGui reserves it for GUI keyboard navigation, so it
+	arrives with gameProcessed = true and the guard below discards it.
 
 	The server only ever sends storyIds and counts; everything displayed --
 	name, rarity, ordering -- is resolved here from the shared StoryData module.
@@ -16,13 +19,26 @@ local UserInputService = game:GetService("UserInputService")
 
 local StoryData = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("StoryData"))
 
-local Remotes = ReplicatedStorage:WaitForChild("Remotes")
-local InventoryUpdated = Remotes:WaitForChild("InventoryUpdated")
-local GetInventory = Remotes:WaitForChild("GetInventory")
+-- Timed, so a missing instance says so instead of yielding forever. An untimed
+-- WaitForChild here would leave the script hanging with the UI simply absent --
+-- the hardest kind of failure to diagnose.
+local Remotes = ReplicatedStorage:WaitForChild("Remotes", 10)
+if not Remotes then
+	warn("InventoryUi: ReplicatedStorage.Remotes is missing -- restart `rojo serve` so it re-reads default.project.json")
+	return
+end
+
+local InventoryUpdated = Remotes:WaitForChild("InventoryUpdated", 10)
+local GetInventory = Remotes:WaitForChild("GetInventory", 10)
+
+if not (InventoryUpdated and GetInventory) then
+	warn("InventoryUi: Remotes folder is missing InventoryUpdated or GetInventory")
+	return
+end
 
 --// Configuration
 
-local TOGGLE_KEY = Enum.KeyCode.Tab
+local TOGGLE_KEY = Enum.KeyCode.B
 local ROW_HEIGHT = 32
 
 local PANEL_BG = Color3.fromRGB(25, 27, 34)
