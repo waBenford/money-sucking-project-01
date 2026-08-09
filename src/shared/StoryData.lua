@@ -18,6 +18,8 @@
 		local first = StoryData.Travelers[StoryData.TravelerOrder[1] ]
 ]]
 
+local ItemCategories = require(script.Parent:WaitForChild("ItemCategories"))
+
 local StoryData = {}
 
 -- Id is the stable key: it goes into DataStores and must never change.
@@ -25,6 +27,10 @@ local StoryData = {}
 export type Story = {
 	Id: string,
 	Name: string,
+	-- An ItemCategories id. Optional here because the entries below do not spell
+	-- it out: the index loop stamps it on every Story before freezing it, so it
+	-- is always a string by the time anything can read one.
+	Category: string?,
 	Rarity: number, -- 1 (common) to 5 (legendary)
 	BaseReward: number, -- money per dream cycle, before bed multipliers
 	Weight: number, -- relative drop chance within this Traveler's pool
@@ -113,6 +119,11 @@ for travelerId, traveler in pairs(Travelers) do
 			storiesById[story.Id] == nil,
 			("StoryData: duplicate story id '%s' (in traveler '%s')"):format(story.Id, travelerId)
 		)
+
+		-- Assigned here rather than repeated on all eighteen entries: every Story
+		-- is by definition in the Story category, and the inventory tabs filter
+		-- on this field. Must happen before the freeze below.
+		story.Category = ItemCategories.STORY
 
 		storiesById[story.Id] = story
 		total += story.Weight
