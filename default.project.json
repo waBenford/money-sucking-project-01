@@ -6,6 +6,15 @@
     "ReplicatedStorage": {
       "Shared": {
         "$path": "src/shared"
+      },
+      "Remotes": {
+        "$className": "Folder",
+        "InventoryUpdated": {
+          "$className": "RemoteEvent"
+        },
+        "GetInventory": {
+          "$className": "RemoteFunction"
+        }
       }
     },
 
