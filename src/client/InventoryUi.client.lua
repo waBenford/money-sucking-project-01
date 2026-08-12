@@ -37,7 +37,11 @@ local Workspace = game:GetService("Workspace")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local InventoryConfig = require(Shared:WaitForChild("InventoryConfig"))
 local ItemCategories = require(Shared:WaitForChild("ItemCategories"))
-local StoryData = require(Shared:WaitForChild("StoryData"))
+-- ItemData, not StoryData: the bag holds accessories and bed upgrades as well
+-- now, and resolving through the Story catalog alone would silently drop every
+-- slot that is not a Story.
+local ItemData = require(Shared:WaitForChild("ItemData"))
+local Rarity = require(Shared:WaitForChild("Rarity"))
 local Theme = require(Shared:WaitForChild("Theme"))
 
 -- Timed, so a missing instance says so instead of yielding forever. An untimed
@@ -150,16 +154,31 @@ local function button(props)
 	return make("TextButton", props)
 end
 
--- Driven by MAX_RARITY, so adding a sixth tier needs no UI change.
+-- Driven by Rarity.MAX, so the six-tier ladder the shop introduced needs no UI
+-- change here. Stories only reach five and simply show two empty pips.
 local function rarityStars(rarity)
-	return string.rep("*", rarity) .. string.rep("-", StoryData.MAX_RARITY - rarity)
+	return string.rep("*", rarity) .. string.rep("-", Rarity.MAX - rarity)
 end
 
-local function slotsUsed()
-	local used = 0
-	for _ in pairs(entries) do
-		used += 1
+-- Capacity is per category, so the counter answers for whichever tab is open:
+-- the ALL tab sums every category, a single tab reports only its own.
+local function capacityFor(category)
+	if category == ItemCategories.ALL then
+		return InventoryConfig.totalSlots()
 	end
+	return InventoryConfig.slotsFor(category)
+end
+
+local function slotsUsedIn(category)
+	local used = 0
+
+	for itemId in pairs(entries) do
+		local item = ItemData.getItemById(itemId)
+		if item and (category == ItemCategories.ALL or item.Category == category) then
+			used += 1
+		end
+	end
+
 	return used
 end
 
@@ -311,7 +330,7 @@ local capacityLabel = label({
 	Name = "Capacity",
 	Position = UDim2.fromOffset(296, 0),
 	Size = UDim2.fromOffset(160, TOOLBAR_HEIGHT),
-	Text = "0/" .. InventoryConfig.MAX_SLOTS,
+	Text = "0/" .. InventoryConfig.totalSlots(),
 	TextSize = 18,
 	Font = Enum.Font.GothamBold,
 	TextXAlignment = Enum.TextXAlignment.Left,
@@ -589,25 +608,34 @@ local confirmDiscard = round(button({
 
 local refresh -- forward declared: selection and the dialog both drive it
 
-local function setDetail(storyId)
-	local entry = storyId and entries[storyId]
-	local story = storyId and StoryData.getStoryById(storyId)
+local function setDetail(itemId)
+	local entry = itemId and entries[itemId]
+	local item = itemId and ItemData.getItemById(itemId)
 
-	if not (entry and story) then
+	if not (entry and item) then
 		-- Nothing selected: the whole popup goes away rather than sitting there
 		-- empty, which is what the mockup's "appears when you click an item" means.
 		detail.Visible = false
 		return
 	end
 
-	detailName.Text = story.Name
-	detailRarity.Text = ("Rarity  %s"):format(rarityStars(story.Rarity))
-	detailRarity.TextColor3 = Theme.rarityColor(story.Rarity)
+	detailName.Text = item.Name
+	detailRarity.Text = ("Rarity  %s"):format(rarityStars(item.Rarity))
+	detailRarity.TextColor3 = Theme.rarityColor(item.Rarity)
 	-- The last fallback is for data that forgot to set a category: a nil here
 	-- would make format() throw and take the whole popup with it.
-	local categoryName = ItemCategories.DisplayNames[story.Category] or story.Category or "Unknown"
+	local categoryName = ItemCategories.DisplayNames[item.Category] or item.Category or "Unknown"
 	detailCategory.Text = ("Category  %s"):format(categoryName)
-	detailReward.Text = ("Dream reward  %d per cycle"):format(story.BaseReward)
+
+	-- One line for what the item is worth, whichever kind it is. Stories pay out
+	-- at the bed; accessories and upgrades carry a buff instead, and reading
+	-- BaseReward off one of those would format a nil and take the popup down.
+	if item.BaseReward then
+		detailReward.Text = ("Dream reward  %d per cycle"):format(item.BaseReward)
+	else
+		detailReward.Text = ItemData.describeBuff(item) or ""
+	end
+
 	detailHeld.Text = ("Held  %d / %d"):format(entry.count, InventoryConfig.MAX_STACK)
 
 	detail.Visible = true
@@ -636,7 +664,7 @@ local function createSlot(story)
 		BackgroundColor3 = Theme.SLOT_BG,
 		Text = "",
 		-- Higher rarity sorts to the top.
-		LayoutOrder = StoryData.MAX_RARITY - story.Rarity,
+		LayoutOrder = Rarity.MAX - story.Rarity,
 	}), 6)
 
 	make("UIStroke", {
@@ -683,7 +711,7 @@ function refresh()
 	local visible = 0
 
 	for storyId, entry in pairs(entries) do
-		local story = StoryData.getStoryById(storyId)
+		local story = ItemData.getItemById(storyId)
 		local matchesTab = story and ItemCategories.matches(activeTab, story.Category)
 		local matchesSearch = searchText == ""
 			or (story and string.find(string.lower(story.Name), searchText, 1, true) ~= nil)
@@ -715,9 +743,13 @@ function refresh()
 			else ItemCategories.EmptyMessages[activeTab] or "Nothing here yet."
 	end
 
-	local used = slotsUsed()
-	capacityLabel.Text = ("%d/%d"):format(used, InventoryConfig.MAX_SLOTS)
-	capacityLabel.TextColor3 = (used >= InventoryConfig.MAX_SLOTS) and Theme.DANGER or Theme.TEXT
+	-- Reports the open tab's own budget, because that is the limit a player is
+	-- about to hit: a full Upgrade shelf does not stop them collecting Stories.
+	local capacity = capacityFor(activeTab)
+	local used = slotsUsedIn(activeTab)
+
+	capacityLabel.Text = ("%d/%d"):format(used, capacity)
+	capacityLabel.TextColor3 = (used >= capacity) and Theme.DANGER or Theme.TEXT
 
 	for categoryId, tabButton in pairs(tabButtons) do
 		local isActive = categoryId == activeTab
@@ -727,7 +759,7 @@ function refresh()
 end
 
 local function setCount(storyId, count)
-	local story = StoryData.getStoryById(storyId)
+	local story = ItemData.getItemById(storyId)
 	if not story then
 		-- A story removed in a later update: ignore rather than render a blank
 		-- slot from an old save.
@@ -846,7 +878,7 @@ end
 
 trashButton.MouseButton1Click:Connect(function()
 	local entry = selectedId and entries[selectedId]
-	local story = selectedId and StoryData.getStoryById(selectedId)
+	local story = selectedId and ItemData.getItemById(selectedId)
 	if not (entry and story) then
 		return
 	end
@@ -869,7 +901,7 @@ amountCancel.MouseButton1Click:Connect(closeDialog)
 confirmCancel.MouseButton1Click:Connect(showAmountStep)
 
 amountNext.MouseButton1Click:Connect(function()
-	local story = selectedId and StoryData.getStoryById(selectedId)
+	local story = selectedId and ItemData.getItemById(selectedId)
 	if not story then
 		closeDialog()
 		return

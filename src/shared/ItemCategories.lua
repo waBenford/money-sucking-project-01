@@ -23,12 +23,17 @@ local ItemCategories = {}
 ItemCategories.ALL = "all"
 ItemCategories.STORY = "story"
 ItemCategories.ACCESSORIES = "accessories"
+-- The four bed slots (pillow, blanket, body pillow, mattress). Its own category
+-- rather than folded into BOOST: an upgrade is a permanent part of the bed,
+-- while a boost is a temporary effect, and the bag needs to tell them apart.
+ItemCategories.UPGRADE = "upgrade"
 ItemCategories.BOOST = "boost"
 
 ItemCategories.Order = table.freeze({
 	ItemCategories.ALL,
 	ItemCategories.STORY,
 	ItemCategories.ACCESSORIES,
+	ItemCategories.UPGRADE,
 	ItemCategories.BOOST,
 })
 
@@ -36,6 +41,7 @@ ItemCategories.DisplayNames = table.freeze({
 	[ItemCategories.ALL] = "ALL",
 	[ItemCategories.STORY] = "Story",
 	[ItemCategories.ACCESSORIES] = "Accessories",
+	[ItemCategories.UPGRADE] = "Upgrade",
 	[ItemCategories.BOOST] = "Boost",
 })
 
@@ -45,7 +51,8 @@ ItemCategories.DisplayNames = table.freeze({
 ItemCategories.EmptyMessages = table.freeze({
 	[ItemCategories.ALL] = "Your inventory is empty.\nCollect Stories from the conveyor belt.",
 	[ItemCategories.STORY] = "No Stories yet.\nCollect them from the conveyor belt.",
-	[ItemCategories.ACCESSORIES] = "Accessories are coming soon.",
+	[ItemCategories.ACCESSORIES] = "No accessories yet.\nRoll for them at the shop.",
+	[ItemCategories.UPGRADE] = "No bed upgrades yet.\nRoll for them at the shop.",
 	[ItemCategories.BOOST] = "Boosts are coming soon.",
 })
 
