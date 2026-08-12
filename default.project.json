@@ -17,6 +17,15 @@
         },
         "DiscardItem": {
           "$className": "RemoteEvent"
+        },
+        "StartDream": {
+          "$className": "RemoteEvent"
+        },
+        "BedStateChanged": {
+          "$className": "RemoteEvent"
+        },
+        "GetBedState": {
+          "$className": "RemoteFunction"
         }
       }
     },
