@@ -18,6 +18,9 @@
         "DiscardItem": {
           "$className": "RemoteEvent"
         },
+        "ShopRequest": {
+          "$className": "RemoteFunction"
+        },
         "StartDream": {
           "$className": "RemoteEvent"
         },

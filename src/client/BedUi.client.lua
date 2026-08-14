@@ -474,10 +474,18 @@ end)
 
 task.spawn(function()
 	local snapshot = GetInventory:InvokeServer()
-	if type(snapshot) == "table" then
-		for storyId, count in pairs(snapshot) do
-			-- Only fill gaps: a live update that already arrived is newer than
-			-- this snapshot.
+
+	-- GetInventory answers { items = { [storyId] = count }, revision = n }. Read
+	-- through .items: iterating the envelope itself put "items" and "revision"
+	-- into counts as story ids, which left this list empty until the next grant
+	-- arrived -- so a rejoining player could not dream anything they already had.
+	--
+	-- The revision is ignored here on purpose. "Only fill gaps" already lets a
+	-- live update beat the snapshot, and decrements arrive as live updates.
+	local items = if type(snapshot) == "table" then snapshot.items else nil
+
+	if type(items) == "table" then
+		for storyId, count in pairs(items) do
 			if counts[storyId] == nil then
 				counts[storyId] = count
 			end

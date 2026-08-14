@@ -1,24 +1,28 @@
 --[[
 	InventoryService
-	Owns every player's collected Stories. Nothing else may write to an
-	inventory directly.
+	Owns every player's bag -- Stories, Accessories and bed Upgrades alike.
+	Nothing else may write to an inventory directly.
 
 	Server-only on purpose: this lives in ServerScriptService, not
-	ReplicatedStorage, so no client can require it or read its logic. StoryData
-	is shared because clients need names and rarities to render items; grant
-	logic is not.
+	ReplicatedStorage, so no client can require it or read its logic. The item
+	catalogs are shared because clients need names and rarities to render items;
+	grant logic is not.
 
 	Collecting a Story stores it. Money is earned later, by dreaming it at the
 	bed -- this module deliberately never touches leaderstats.
 
+	Ids are resolved through ItemData, which indexes all three catalogs. It used
+	to be StoryData alone, which meant a rolled accessory was rejected as an
+	unknown story and could never enter the bag.
+
 	Capacity comes from ReplicatedStorage.Shared.InventoryConfig, which the UI
-	reads too: MAX_SLOTS distinct kinds, MAX_STACK copies of each. This module is
-	the only thing that enforces them -- the client merely displays them.
+	reads too: a slot budget *per category*, MAX_STACK copies of each kind. This
+	module is the only thing that enforces them -- the client merely displays them.
 
 	Usage:
 		local InventoryService = require(ServerScriptService.Server.InventoryService)
 
-		local ok, reason = InventoryService.grantStory(player, "salt_road_lullaby")
+		local ok, reason = InventoryService.grantItem(player, "salt_road_lullaby")
 		local count = InventoryService.getCount(player, "salt_road_lullaby")
 		local ok, left = InventoryService.discardStory(player, "salt_road_lullaby", 2)
 ]]
@@ -28,11 +32,11 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local InventoryConfig = require(Shared:WaitForChild("InventoryConfig"))
-local StoryData = require(Shared:WaitForChild("StoryData"))
+local ItemData = require(Shared:WaitForChild("ItemData"))
 
 local InventoryService = {}
 
--- [player] = { [storyId] = count }
+-- [player] = { [itemId] = count }
 local inventories = {}
 
 -- [player] = number. Bumped on every change and sent out with every event and
@@ -54,11 +58,21 @@ InventoryService.StoryRemoved = Instance.new("BindableEvent")
 
 -- Slots, not copies: one kind of item occupies exactly one slot no matter how
 -- many are stacked in it, which is what the "n/20" counter in the UI shows.
-local function slotsUsed(inventory)
+--
+-- Counted per category, so a bag full of bed upgrades cannot stop a player
+-- collecting Stories. Items whose id no longer resolves (a catalog entry removed
+-- in a later update) are skipped rather than charged to a category, which would
+-- otherwise be an unreachable slot nobody could free.
+local function slotsUsedIn(inventory, category: string): number
 	local used = 0
-	for _ in pairs(inventory) do
-		used += 1
+
+	for itemId in pairs(inventory) do
+		local item = ItemData.getItemById(itemId)
+		if item and item.Category == category then
+			used += 1
+		end
 	end
+
 	return used
 end
 
@@ -70,27 +84,27 @@ end
 
 --// API
 
--- Grants one copy of a Story. Takes only a player and an id: the Story -- and
--- therefore its BaseReward -- is re-derived from StoryData rather than trusted
--- from the caller, so nothing upstream can inflate a reward by passing its own
--- numbers. Returns false plus a reason rather than erroring, leaving the
+-- Grants one copy of any item. Takes only a player and an id: the item -- and
+-- therefore its reward or buff -- is re-derived from ItemData rather than
+-- trusted from the caller, so nothing upstream can inflate a payout by passing
+-- its own numbers. Returns false plus a reason rather than erroring, leaving the
 -- caller to decide what the player sees.
-function InventoryService.grantStory(player: Player, storyId: string): (boolean, string?)
+function InventoryService.grantItem(player: Player, itemId: string): (boolean, string?)
 	local inventory = inventories[player]
 	if not inventory then
 		-- Player left mid-collection, or was never registered.
 		return false, "no_inventory"
 	end
 
-	local story = StoryData.getStoryById(storyId)
-	if not story then
-		-- A story id that does not exist means a bug in the caller, not player
-		-- input, so it is worth surfacing.
-		warn(("InventoryService: unknown story id '%s'"):format(tostring(storyId)))
-		return false, "unknown_story"
+	local item = ItemData.getItemById(itemId)
+	if not item then
+		-- An id that does not exist means a bug in the caller, not player input,
+		-- so it is worth surfacing.
+		warn(("InventoryService: unknown item id '%s'"):format(tostring(itemId)))
+		return false, "unknown_item"
 	end
 
-	local count = inventory[storyId]
+	local count = inventory[itemId]
 
 	if count then
 		-- A stack tops out instead of spilling into a second slot, so a player
@@ -98,18 +112,24 @@ function InventoryService.grantStory(player: Player, storyId: string): (boolean,
 		if count >= InventoryConfig.MAX_STACK then
 			return false, "stack_full"
 		end
-	elseif slotsUsed(inventory) >= InventoryConfig.MAX_SLOTS then
-		-- Only a *new* kind needs a free slot; topping up an existing stack is
-		-- always allowed by this check.
+	elseif slotsUsedIn(inventory, item.Category) >= InventoryConfig.slotsFor(item.Category) then
+		-- Only a *new* kind needs a free slot, and only in its own category;
+		-- topping up an existing stack is always allowed by this check.
 		return false, "inventory_full"
 	end
 
 	local newCount = (count or 0) + 1
-	inventory[storyId] = newCount
+	inventory[itemId] = newCount
 
-	InventoryService.StoryGranted:Fire(player, storyId, newCount, bumpRevision(player))
+	InventoryService.StoryGranted:Fire(player, itemId, newCount, bumpRevision(player))
 
 	return true
+end
+
+-- The name the conveyor and any Story-only caller can keep using. Same gate,
+-- same rules; it just reads better at a call site that only ever has a Story.
+function InventoryService.grantStory(player: Player, storyId: string): (boolean, string?)
+	return InventoryService.grantItem(player, storyId)
 end
 
 -- Shared by consumeStory and discardStory. Returns the count left, or nil when
