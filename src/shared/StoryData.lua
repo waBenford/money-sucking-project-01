@@ -99,6 +99,88 @@ local Travelers: { [string]: Traveler } = {
 	},
 }
 
+--// Story Levels
+--
+-- The progression ladder the Quest NPC sells. A player's StoryLevel decides how
+-- much of the catalogue their conveyor may spawn, and the pool is CUMULATIVE:
+-- reaching Level 2 adds its stories to Level 1's rather than replacing them.
+--
+-- This is the one place a Story is assigned to a Level. Everything else derives
+-- from it -- story.Level is stamped from here in the loop below, and the load
+-- asserts catch an id that is listed twice or not at all.
+
+export type StoryLevel = {
+	Level: number,
+	UnlockCost: number, -- money to reach this level; Level 1 costs nothing
+	StoryIds: { string },
+}
+
+local Levels: { StoryLevel } = {
+	{
+		Level = 1,
+		UnlockCost = 0, -- everyone starts here
+		StoryIds = {
+			"a_dreamless_nap",
+			"rain_on_the_window",
+			"the_long_road_home",
+			"a_market_at_dawn",
+			"the_coin_that_returned",
+			"salt_road_lullaby",
+		},
+	},
+	{
+		Level = 2,
+		UnlockCost = 2500,
+		StoryIds = {
+			"fog_before_morning",
+			"the_tide_chart",
+			"letters_never_sent",
+			"the_ship_that_waited",
+			"city_beneath_the_salt",
+			"ocean_that_dreamed_a_man",
+		},
+	},
+	{
+		Level = 3,
+		UnlockCost = 30000,
+		StoryIds = {
+			"a_footnote_in_gold",
+			"the_borrowed_hour",
+			"the_cartographers_regret",
+			"where_the_compass_spins",
+			"emperor_of_small_hours",
+			"last_travelers_confession",
+		},
+	},
+}
+
+StoryData.MAX_LEVEL = #Levels
+StoryData.MIN_LEVEL = 1
+
+-- Built before the index loop, because that loop stamps story.Level from it.
+local levelByStoryId: { [string]: number } = {}
+local unlockCostByLevel: { [number]: number } = {}
+
+for _, entry in ipairs(Levels) do
+	unlockCostByLevel[entry.Level] = entry.UnlockCost
+
+	for _, storyId in ipairs(entry.StoryIds) do
+		assert(
+			levelByStoryId[storyId] == nil,
+			("StoryData: story '%s' is listed in more than one Level"):format(storyId)
+		)
+		levelByStoryId[storyId] = entry.Level
+	end
+
+	table.freeze(entry.StoryIds)
+	table.freeze(entry)
+end
+
+table.freeze(Levels)
+table.freeze(unlockCostByLevel)
+
+StoryData.Levels = Levels
+
 --// Load-time indexes
 --
 -- All built once at require: the conveyor calls getRandomStory on a timer, so
@@ -125,6 +207,13 @@ for travelerId, traveler in pairs(Travelers) do
 		-- on this field. Must happen before the freeze below.
 		story.Category = ItemCategories.STORY
 
+		-- Stamped from the Levels table, same as Category. A Story missing from
+		-- every Level would silently never spawn, so fail at startup instead.
+		story.Level = assert(
+			levelByStoryId[story.Id],
+			("StoryData: story '%s' is not listed in any Level"):format(story.Id)
+		)
+
 		storiesById[story.Id] = story
 		total += story.Weight
 
@@ -150,12 +239,52 @@ table.sort(StoryData.TravelerOrder, function(a, b)
 	return Travelers[a].Level < Travelers[b].Level
 end)
 
+-- The other half of the Level check: every id listed in Levels must resolve to
+-- a real Story. A typo here would otherwise just shrink the spawn pool quietly.
+for _, entry in ipairs(Levels) do
+	for _, storyId in ipairs(entry.StoryIds) do
+		assert(
+			storiesById[storyId],
+			("StoryData: Level %d lists unknown story '%s'"):format(entry.Level, storyId)
+		)
+	end
+end
+
 table.freeze(Travelers)
 table.freeze(storiesById)
 table.freeze(totalWeights)
 table.freeze(StoryData.TravelerOrder)
 
 StoryData.Travelers = Travelers
+
+-- Cumulative spawn pools, one per reachable level: poolsByMaxLevel[n] holds
+-- every Story with Level <= n. Precomputed because the conveyor asks for one on
+-- a timer, and rebuilding the list per spawn would be pure waste.
+local poolsByMaxLevel: { [number]: { stories: { Story }, totalWeight: number } } = {}
+
+for maxLevel = StoryData.MIN_LEVEL, StoryData.MAX_LEVEL do
+	local stories = {}
+	local totalWeight = 0
+
+	-- Walked in Level order so the pool is deterministic, which keeps the
+	-- weighted walk below reproducible for a given seed.
+	for _, entry in ipairs(Levels) do
+		if entry.Level <= maxLevel then
+			for _, storyId in ipairs(entry.StoryIds) do
+				local story = storiesById[storyId]
+				table.insert(stories, story)
+				totalWeight += story.Weight
+			end
+		end
+	end
+
+	assert(totalWeight > 0, ("StoryData: level %d has no drop weight"):format(maxLevel))
+
+	table.freeze(stories)
+	poolsByMaxLevel[maxLevel] = table.freeze({ stories = stories, totalWeight = totalWeight })
+end
+
+table.freeze(poolsByMaxLevel)
 
 -- Its own stream, so no other script reseeding the global math.random generator
 -- can shift the drop rates.
@@ -199,6 +328,41 @@ function StoryData.getRandomStory(travelerId: string): Story?
 	-- Accumulated float error can leave roll a hair above the final cumulative.
 	-- Without this the loop falls through and returns nil to the caller.
 	return traveler.Stories[#traveler.Stories]
+end
+
+--// Levels
+
+-- Money required to reach `level`. Returns nil past the last one, which is how
+-- callers tell "max level" from "free".
+function StoryData.getUnlockCost(level: number): number?
+	return unlockCostByLevel[level]
+end
+
+-- Weighted pick across every Story from Level 1 up to maxLevel -- the conveyor's
+-- entry point. Same cumulative walk as getRandomStory, over a precomputed pool.
+function StoryData.getRandomStoryUpToLevel(maxLevel: number): Story?
+	-- Clamped rather than rejected: a player's level is server data, but it can
+	-- legitimately be missing for a frame during join, and a belt should keep
+	-- spawning Level 1 stories rather than stall.
+	local clamped = math.clamp(
+		math.floor(tonumber(maxLevel) or StoryData.MIN_LEVEL),
+		StoryData.MIN_LEVEL,
+		StoryData.MAX_LEVEL
+	)
+
+	local pool = poolsByMaxLevel[clamped]
+	local roll = rng:NextNumber(0, pool.totalWeight)
+	local cumulative = 0
+
+	for _, story in ipairs(pool.stories) do
+		cumulative += story.Weight
+		if roll <= cumulative then
+			return story
+		end
+	end
+
+	-- Same float-rounding guard as above.
+	return pool.stories[#pool.stories]
 end
 
 return StoryData
