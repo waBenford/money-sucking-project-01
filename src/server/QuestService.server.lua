@@ -138,21 +138,28 @@ local function tryUnlock(player)
 
 	local cost = StoryData.getUnlockCost(nextLevel)
 	if not cost then
-		return false, "max_level"
+		return false, "max_level", money.Value
 	end
 
-	if money.Value < cost then
-		return false, "insufficient_funds"
+	-- Captured here, inside the no-yield window below, so the figure reported
+	-- back is exactly the one the decision was made on.
+	local balance = money.Value
+
+	if balance < cost then
+		-- Returned to the client so the panel can show what the SERVER sees. A
+		-- client whose replica was edited locally would otherwise render an
+		-- affordable price next to a refusal and look broken.
+		return false, "insufficient_funds", balance
 	end
 
 	-- Nothing between the check above and these two writes may yield. Read
 	-- -check-write on a replicated value is only atomic while this thread never
 	-- suspends, and a yield in that gap is exactly how a double-click buys two
 	-- levels for one payment.
-	money.Value -= cost
+	money.Value = balance - cost
 	storyLevel.Value = nextLevel
 
-	return true
+	return true, nil, money.Value
 end
 
 --// Plot wiring
@@ -182,10 +189,11 @@ UnlockLevel.OnServerEvent:Connect(function(player)
 	end
 	lastRequest[player] = now
 
-	local ok, reason = tryUnlock(player)
-	-- Told back to the client so the panel can explain itself. The panel already
-	-- knows the cost and the player's money, so this only ever confirms.
-	UnlockResult:FireClient(player, ok, reason)
+	local ok, reason, balance = tryUnlock(player)
+	-- The balance is the server's own value for this player, which the client
+	-- already holds a replica of -- nothing new is disclosed. Sending it lets the
+	-- panel report the authoritative figure instead of contradicting itself.
+	UnlockResult:FireClient(player, ok, reason, balance)
 end)
 
 Players.PlayerRemoving:Connect(function(player)

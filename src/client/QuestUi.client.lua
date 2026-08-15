@@ -360,15 +360,27 @@ storyLevel.Changed:Connect(function()
 	end
 end)
 
-UnlockResult.OnClientEvent:Connect(function(ok, reason)
+UnlockResult.OnClientEvent:Connect(function(ok, reason, serverMoney)
 	if not panel.Visible then
 		return
 	end
 
 	if ok then
 		statusLabel.Text = "Unlocked. New Stories will start appearing on your belt."
-	elseif reason == "insufficient_funds" then
-		statusLabel.Text = "Not enough money yet."
+		return
+	end
+
+	if reason == "insufficient_funds" then
+		local cost = StoryData.getUnlockCost(storyLevel.Value + 1) or 0
+		statusLabel.Text = ("Server sees $%d -- you need $%d."):format(serverMoney or 0, cost)
+
+		-- The client's replica can be edited locally without ever reaching the
+		-- server (Studio's Client-context command bar does exactly that). Saying
+		-- so here is the difference between an obvious answer and an afternoon
+		-- of debugging a panel that appears to contradict itself.
+		if serverMoney and serverMoney ~= money.Value then
+			statusLabel.Text ..= (" Your client shows $%d -- it is out of date."):format(money.Value)
+		end
 	elseif reason == "max_level" then
 		statusLabel.Text = "Already at max level."
 	elseif reason == "no_plot" then
