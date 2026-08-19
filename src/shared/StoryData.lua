@@ -286,6 +286,49 @@ end
 
 table.freeze(poolsByMaxLevel)
 
+-- Per-level Story lists, and the quest requirement derived from them: one copy
+-- of each rarity the level contains. Derived rather than authored, so adding a
+-- Story to a Level automatically updates both what the panel shows and what the
+-- server demands.
+local storiesByLevel: { [number]: { Story } } = {}
+local requirementByLevel: { [number]: { { Rarity: number, StoryIds: { string } } } } = {}
+
+for _, entry in ipairs(Levels) do
+	local stories = {}
+	local idsByRarity: { [number]: { string } } = {}
+	local rarities = {}
+
+	for _, storyId in ipairs(entry.StoryIds) do
+		local story = storiesById[storyId]
+		table.insert(stories, story)
+
+		local bucket = idsByRarity[story.Rarity]
+		if not bucket then
+			bucket = {}
+			idsByRarity[story.Rarity] = bucket
+			table.insert(rarities, story.Rarity)
+		end
+
+		table.insert(bucket, storyId)
+	end
+
+	-- Ascending, so the panel lists the cheap commons before the legendary and
+	-- the server reports missing rarities in a readable order.
+	table.sort(rarities)
+
+	local requirement = {}
+	for _, rarity in ipairs(rarities) do
+		table.freeze(idsByRarity[rarity])
+		table.insert(requirement, table.freeze({ Rarity = rarity, StoryIds = idsByRarity[rarity] }))
+	end
+
+	storiesByLevel[entry.Level] = table.freeze(stories)
+	requirementByLevel[entry.Level] = table.freeze(requirement)
+end
+
+table.freeze(storiesByLevel)
+table.freeze(requirementByLevel)
+
 -- Its own stream, so no other script reseeding the global math.random generator
 -- can shift the drop rates.
 local rng = Random.new()
@@ -336,6 +379,25 @@ end
 -- callers tell "max level" from "free".
 function StoryData.getUnlockCost(level: number): number?
 	return unlockCostByLevel[level]
+end
+
+-- Every Story belonging to `level`, in the order it is listed. The quest panel
+-- shows this as "what you will get" for the level being unlocked.
+function StoryData.getLevelStories(level: number): { Story }
+	return storiesByLevel[level] or {}
+end
+
+-- What the quest for `level` demands in Stories: one copy of each rarity that
+-- level contains.
+--
+-- Grouped by rarity rather than listed as flat ids because a level can hold two
+-- Stories of the same rarity (every level has two commons), and either one
+-- satisfies that slot. Callers pick whichever the player actually holds.
+--
+-- The client renders from this and the server validates against it, so the
+-- requirement shown and the requirement enforced cannot drift apart.
+function StoryData.getQuestRequirement(level: number): { { Rarity: number, StoryIds: { string } } }
+	return requirementByLevel[level] or {}
 end
 
 -- Weighted pick across every Story from Level 1 up to maxLevel -- the conveyor's

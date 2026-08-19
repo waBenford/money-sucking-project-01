@@ -15,12 +15,14 @@
 local CollectionService = game:GetService("CollectionService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
 local Workspace = game:GetService("Workspace")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local QuestConfig = require(Shared:WaitForChild("QuestConfig"))
 local StoryData = require(Shared:WaitForChild("StoryData"))
 local Theme = require(Shared:WaitForChild("Theme"))
+local InventoryService = require(ServerScriptService:WaitForChild("Server"):WaitForChild("InventoryService"))
 
 local Remotes = ReplicatedStorage:WaitForChild("Remotes", 10)
 if not Remotes then
@@ -152,10 +154,46 @@ local function tryUnlock(player)
 		return false, "insufficient_funds", balance
 	end
 
-	-- Nothing between the check above and these two writes may yield. Read
-	-- -check-write on a replicated value is only atomic while this thread never
-	-- suspends, and a yield in that gap is exactly how a double-click buys two
-	-- levels for one payment.
+	-- The quest costs Stories from the level being completed, one of each rarity
+	-- it contains. Resolve which copy pays for each slot BEFORE spending
+	-- anything: a quest that eats three Stories and then fails on the fourth
+	-- leaves the player worse off with nothing to show, and unlike money that is
+	-- not something they can simply re-earn in a minute.
+	local chosen = {}
+	local missingRarities = {}
+
+	for _, group in ipairs(StoryData.getQuestRequirement(storyLevel.Value)) do
+		local held = nil
+
+		-- A rarity can have several candidate Stories (every level has two
+		-- commons); any one of them fills the slot. First held wins, in listed
+		-- order, so the choice is deterministic.
+		for _, storyId in ipairs(group.StoryIds) do
+			if InventoryService.getCount(player, storyId) > 0 then
+				held = storyId
+				break
+			end
+		end
+
+		if held then
+			table.insert(chosen, held)
+		else
+			table.insert(missingRarities, group.Rarity)
+		end
+	end
+
+	if #missingRarities > 0 then
+		return false, "missing_stories", balance, missingRarities
+	end
+
+	-- Everything below is one straight line with no yields, so the whole payment
+	-- lands or none of it does. getCount and consumeStory are both synchronous,
+	-- which is what makes that hold -- and it is the same reason the money write
+	-- must not be separated from its check by a wait.
+	for _, storyId in ipairs(chosen) do
+		InventoryService.consumeStory(player, storyId)
+	end
+
 	money.Value = balance - cost
 	storyLevel.Value = nextLevel
 
@@ -189,11 +227,11 @@ UnlockLevel.OnServerEvent:Connect(function(player)
 	end
 	lastRequest[player] = now
 
-	local ok, reason, balance = tryUnlock(player)
+	local ok, reason, balance, missingRarities = tryUnlock(player)
 	-- The balance is the server's own value for this player, which the client
 	-- already holds a replica of -- nothing new is disclosed. Sending it lets the
 	-- panel report the authoritative figure instead of contradicting itself.
-	UnlockResult:FireClient(player, ok, reason, balance)
+	UnlockResult:FireClient(player, ok, reason, balance, missingRarities)
 end)
 
 Players.PlayerRemoving:Connect(function(player)
