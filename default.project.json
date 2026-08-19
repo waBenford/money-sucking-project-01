@@ -29,6 +29,12 @@
         },
         "GetBedState": {
           "$className": "RemoteFunction"
+        },
+        "UnlockLevel": {
+          "$className": "RemoteEvent"
+        },
+        "UnlockResult": {
+          "$className": "RemoteEvent"
         }
       }
     },

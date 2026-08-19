@@ -14,6 +14,7 @@
 	the collection mechanic.
 ]]
 
+local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
 local TweenService = game:GetService("TweenService")
@@ -25,8 +26,6 @@ local Theme = require(Shared:WaitForChild("Theme"))
 local InventoryService = require(ServerScriptService:WaitForChild("Server"):WaitForChild("InventoryService"))
 
 --// Configuration
-
-local CURRENT_TRAVELER_ID = "wandering_peddler"
 
 local SPAWN_INTERVAL = 4 -- seconds between items
 local TRAVEL_TIME = 12 -- seconds to cross the belt
@@ -121,7 +120,7 @@ local function createItem(story, conveyor)
 	-- Read by the collection mechanic. StoryId is the authoritative one; the
 	-- rest let UI render an item without a round-trip through StoryData.
 	item:SetAttribute("StoryId", story.Id)
-	item:SetAttribute("TravelerId", CURRENT_TRAVELER_ID)
+	item:SetAttribute("StoryLevel", story.Level)
 	item:SetAttribute("Rarity", story.Rarity)
 	item:SetAttribute("BaseReward", story.BaseReward)
 
@@ -200,10 +199,24 @@ local function tryCollect(player, plot, state, item)
 	InventoryService.grantStory(player, storyId)
 end
 
+-- The plot owner's StoryLevel decides how much of the catalogue may spawn here.
+-- Read per spawn rather than cached, so an unlock takes effect on the very next
+-- item without restarting the belt.
+local function storyLevelFor(plot)
+	local ownerUserId = plot:GetAttribute("OwnerUserId")
+	local player = ownerUserId and Players:GetPlayerByUserId(ownerUserId)
+	local leaderstats = player and player:FindFirstChild("leaderstats")
+	local storyLevel = leaderstats and leaderstats:FindFirstChild("StoryLevel")
+
+	-- Falls back to level 1 rather than skipping the spawn: leaderstats can be a
+	-- frame late on join, and a belt that stalls is worse than one that starts
+	-- with common Stories.
+	return storyLevel and storyLevel.Value or StoryData.MIN_LEVEL
+end
+
 local function spawnItem(plot, state)
-	local story = StoryData.getRandomStory(CURRENT_TRAVELER_ID)
+	local story = StoryData.getRandomStoryUpToLevel(storyLevelFor(plot))
 	if not story then
-		-- StoryData already warns on an unknown traveler id; just skip a beat.
 		return
 	end
 

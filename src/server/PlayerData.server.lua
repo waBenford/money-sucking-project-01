@@ -1,19 +1,27 @@
 --[[
 	PlayerData
-	Loads and saves each player's Money to a DataStore.
+	Loads and saves each player's Money and StoryLevel to a DataStore.
 
-	Money lives in player.leaderstats.Money, which Roblox shows in the player list.
+	Both live in player.leaderstats, which Roblox shows in the player list.
 	Every DataStore call is wrapped in pcall -- they are network calls and will
 	throw if the API is throttled, down, or disabled in Studio.
+
+	The saved value used to be a bare number (Money alone). It is a table now, and
+	the loader still accepts the old shape -- see onPlayerAdded. That is why the
+	key keeps its _v1 name: bumping it would have reset everyone's money.
 ]]
 
 local Players = game:GetService("Players")
 local DataStoreService = game:GetService("DataStoreService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local QuestConfig = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("QuestConfig"))
 
 -- The "_v1" suffix lets us start a fresh key space later without wiping old data.
 local moneyStore = DataStoreService:GetDataStore("PlayerMoney_v1")
 
 local DEFAULT_MONEY = 0
+local DEFAULT_STORY_LEVEL = QuestConfig.DEFAULT_STORY_LEVEL
 
 -- Players whose data loaded successfully. We only save for these, so a failed
 -- load can never overwrite good saved data with the default value.
@@ -35,6 +43,14 @@ local function onPlayerAdded(player)
 	money.Value = DEFAULT_MONEY
 	money.Parent = leaderstats
 
+	-- Shown on the player list beside Money, and read by the conveyor to decide
+	-- which Stories may spawn. The client reads it straight off leaderstats,
+	-- which is why QuestUi needs no remote to display it.
+	local storyLevel = Instance.new("IntValue")
+	storyLevel.Name = "StoryLevel"
+	storyLevel.Value = DEFAULT_STORY_LEVEL
+	storyLevel.Parent = leaderstats
+
 	leaderstats.Parent = player
 
 	local ok, result = pcall(function()
@@ -46,9 +62,14 @@ local function onPlayerAdded(player)
 		return
 	end
 
-	-- A nil result just means this is their first time playing.
-	if result ~= nil then
+	-- Three shapes to handle. nil is a first-time player; a bare number is a save
+	-- written before StoryLevel existed, and keeping that branch is what lets the
+	-- key stay _v1 without wiping anyone's money.
+	if type(result) == "number" then
 		money.Value = result
+	elseif type(result) == "table" then
+		money.Value = result.Money or DEFAULT_MONEY
+		storyLevel.Value = result.StoryLevel or DEFAULT_STORY_LEVEL
 	end
 
 	sessionLoaded[player] = true
@@ -62,12 +83,16 @@ local function savePlayer(player)
 
 	local leaderstats = player:FindFirstChild("leaderstats")
 	local money = leaderstats and leaderstats:FindFirstChild("Money")
-	if not money then
+	local storyLevel = leaderstats and leaderstats:FindFirstChild("StoryLevel")
+	if not (money and storyLevel) then
 		return
 	end
 
 	local ok, err = pcall(function()
-		moneyStore:SetAsync(keyFor(player), money.Value)
+		moneyStore:SetAsync(keyFor(player), {
+			Money = money.Value,
+			StoryLevel = storyLevel.Value,
+		})
 	end)
 
 	if not ok then
